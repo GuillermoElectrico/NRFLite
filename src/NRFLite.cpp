@@ -74,26 +74,57 @@ uint8_t NRFLite::initTwoPin(uint8_t radioId, uint8_t momiPin, uint8_t sckPin, Bi
 
 #endif
 
-void NRFLite::addAckData(void *data, uint8_t length, uint8_t removeExistingAcks)
+void NRFLite::addAckData(void *data, uint8_t length)
 {
-    if (removeExistingAcks)
+    if (_useSack)
     {
-        spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0); // Clear the TX FIFO buffer.
+        if (length > 30) length = 30; // Limit user's data to 30 bytes.
+        
+        // Store data in the byte array used when transmitting SACK packets.
+        _sackData[0] = _radioId;
+        _sackData[1] = _lastSackDataId++;
+        _sackDataLength = length + 2;
+
+        uint8_t* intData = reinterpret_cast<uint8_t*>(data);
+        for (uint8_t i = 0; i < length; i++)
+        {
+            _sackData[i + 2] = intData[i];
+        }
     }
-    
-    // Add the packet to the TX FIFO buffer for pipe 1, the pipe used to receive packets from radios that
-    // send us data.  When we receive the next transmission from a radio, we'll provide this ACK data in the
-    // auto-acknowledgment packet that goes back.
-    spiTransfer(WRITE_OPERATION, (W_ACK_PAYLOAD | 1), data, length);
+    else
+    {
+        // Ensure any previously inserted ACKs are removed.  The hardware supports 3 of these packets but
+        // this isn't implemented in the library.
+        removeAckData();
+
+        // Add the packet to the TX FIFO buffer for pipe 1, the pipe used to receive packets from radios that
+        // send us data.  When we receive the next transmission from a radio, we'll provide this ACK data in the
+        // auto-acknowledgment packet that goes back.
+        spiTransfer(WRITE_OPERATION, (W_ACK_PAYLOAD | 1), data, length);
+    }
+}
+
+void NRFLite::removeAckData()
+{
+    if (_useSack)
+    {
+        _sackDataLength = 0;
+    }
+    else
+    {
+        spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0); // Clear any previously inserted ACK data packets.
+    }
 }
 
 uint8_t NRFLite::hasAckData()
 {
-    // If we have a pipe 0 packet sitting at the top of the RX FIFO buffer, we have auto-acknowledgment data.
-    // We receive ACK data from other radios using the pipe 0 address.
-    if (getPipeOfFirstRxPacket() == 0)
+    if (_sackDataLength > 0)
     {
-        return getRxPacketLength(); // Return the length of the data packet in the RX FIFO buffer.
+        return _sackDataLength - 2; // Exclude the 2 byte packet id.
+    }
+    else if (getPipeOfFirstRxPacket() == 0) // Pipe 0 receives hardware-based ACK packets.
+    {
+        return getRxPacketLength();
     }
     else
     {
@@ -121,9 +152,9 @@ uint8_t NRFLite::hasData(uint8_t usingInterrupts)
     }
     
     // Ensure radio is powered on and in RX mode in case the radio was powered down or in TX mode.
-    uint8_t originalConfigReg = readRegister(CONFIG);
-    uint8_t newConfigReg = originalConfigReg | _BV(PWR_UP) | _BV(PRIM_RX);
-    if (originalConfigReg != newConfigReg) 
+    uint8_t configReg = readRegister(CONFIG);
+    uint8_t newConfigReg = configReg | _BV(PWR_UP) | _BV(PRIM_RX);
+    if (configReg != newConfigReg) 
     { 
         writeRegister(CONFIG, newConfigReg); 
     }
@@ -132,20 +163,30 @@ uint8_t NRFLite::hasData(uint8_t usingInterrupts)
     // it will already be HIGH since we always keep CSN HIGH to prevent the radio from listening to the SPI bus.
     if (_cePin != _csnPin)
     { 
-        if (digitalRead(_cePin) == LOW) digitalWrite(_cePin, HIGH); 
+        if (digitalRead(_cePin) == LOW)
+        {
+            digitalWrite(_cePin, HIGH);
+            delayMicroseconds(STANDBY_TO_RXTX_MODE_MICROS);
+        }
     }
     
     // If the radio was initially powered off, wait for it to turn on.
-    if ((originalConfigReg & _BV(PWR_UP)) == 0)
+    if ((configReg & _BV(PWR_UP)) == 0)
     { 
         delayMicroseconds(POWERDOWN_TO_RXTX_MODE_MICROS);
     }
 
-    // If we have a pipe 1 packet sitting at the top of the RX FIFO buffer, we have data.
-    // We listen for data from other radios using the pipe 1 address.
-    if (getPipeOfFirstRxPacket() == 1)
+    uint8_t pipe = getPipeOfFirstRxPacket();
+
+    if (pipe == 1) // Pipe 1 receives REQUIRE_ACK and NO_ACK packets.
     {
-        return getRxPacketLength(); // Return the length of the data packet in the RX FIFO buffer.
+        _useSack = 0;
+        return getRxPacketLength();
+    }
+    else if (pipe == 2) // Pipe 2 receives REQUIRE_SACK packets (software-based ACK packets).
+    {
+        _useSack = 1;
+        return getRequireSackData();
     }
     else
     {
@@ -163,23 +204,42 @@ uint8_t NRFLite::hasDataISR()
 
 void NRFLite::readData(void *data)
 {
-    // Determine length of data in the RX FIFO buffer and read it.
-    uint8_t dataLength;
-    spiTransfer(READ_OPERATION, R_RX_PL_WID, &dataLength, 1);
-    spiTransfer(READ_OPERATION, R_RX_PAYLOAD, data, dataLength);
-    
-    // Clear data received flag.
-    uint8_t statusReg = readRegister(STATUS);
-    if (statusReg & _BV(RX_DR))
+    if (_requireSackDataLength > 0)
     {
-        writeRegister(STATUS, statusReg | _BV(RX_DR));
+        // Receiver received a REQUIRE_SACK packet and is reading it.
+        uint8_t* intData = reinterpret_cast<uint8_t*>(data);
+        for (uint8_t i = 0; i < _requireSackDataLength - 2; i++)
+        {
+            intData[i] = _requireSackData[i + 2];
+        }
+        _requireSackDataLength = 0;
+    }
+    else if (_sackDataLength > 0)
+    {
+        // Transmitter received a SACK packet and is reading it.
+        uint8_t* intData = reinterpret_cast<uint8_t*>(data);
+        for (uint8_t i = 0; i < _sackDataLength - 2; i++)
+        {
+            intData[i] = _sackData[i + 2];
+        }
+        _sackDataLength = 0;
+    }
+    else
+    {
+        // Determine length of data in the RX FIFO buffer.
+        uint8_t length;
+        spiTransfer(READ_OPERATION, R_RX_PL_WID, &length, 1);
+
+        // Read data from the RX FIFO buffer.
+        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, data, length);
+
+        // Clear data received flag.
+        writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR));
     }
 }
 
 uint8_t NRFLite::send(uint8_t toRadioId, void *data, uint8_t length, SendType sendType)
 {
-    prepForTx(toRadioId, sendType);
-
     // Clear any previously asserted TX success or max retries flags.
     uint8_t statusReg = readRegister(STATUS);
     if (statusReg & _BV(TX_DS) || statusReg & _BV(MAX_RT))
@@ -187,37 +247,45 @@ uint8_t NRFLite::send(uint8_t toRadioId, void *data, uint8_t length, SendType se
         writeRegister(STATUS, statusReg | _BV(TX_DS) | _BV(MAX_RT));
     }
     
-    // Add data to the TX FIFO buffer, with or without an ACK request.
-    if (sendType == NO_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
-    else                    { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD       , data, length); }
-
-    // Start transmission.
-    // If we have separate pins for CE and CSN, CE will be LOW and we must pulse it to start transmission.
-    // If we use the same pin for CE and CSN, CE will already be HIGH and transmission will have started
-    // when data was loaded into the TX FIFO.
-    if (_cePin != _csnPin)
+    if (sendType == REQUIRE_SACK) 
     {
-        digitalWrite(_cePin, HIGH);
-        delayMicroseconds(CE_TRANSMISSION_MICROS);
-        digitalWrite(_cePin, LOW);
+        // Send the data and wait for a SACK packet (software-based ACK packet).
+        return sendRequireSackData(toRadioId, data, length);
     }
-    
-    // Wait for transmission to succeed or fail.
-    while (1)
+    else
     {
-        delayMicroseconds(_transmissionRetryWaitMicros);
-        statusReg = readRegister(STATUS);
-        
-        if (statusReg & _BV(TX_DS))
+        prepForTx(toRadioId, sendType);
+
+        if (sendType == REQUIRE_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD, data, length); }
+        else if (sendType == NO_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
+
+        // Start transmission.
+        // If we have separate pins for CE and CSN, CE will be LOW and we must pulse it to start transmission.
+        // If we use the same pin for CE and CSN, CE will already be HIGH and transmission will have started
+        // when data was loaded into the TX FIFO buffer.
+        if (_cePin != _csnPin)
         {
-            writeRegister(STATUS, statusReg | _BV(TX_DS));   // Clear TX success flag.
-            return 1;                                        // Return success.
+            digitalWrite(_cePin, HIGH);
+            delayMicroseconds(CE_TRANSMISSION_MICROS);
+            digitalWrite(_cePin, LOW);
         }
-        else if (statusReg & _BV(MAX_RT))
+
+        while (1)
         {
-            spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0); // Clear TX FIFO buffer.
-            writeRegister(STATUS, statusReg | _BV(MAX_RT));  // Clear flag which indicates max retries has been reached.
-            return 0;                                        // Return failure.
+            delayMicroseconds(_transmissionRetryWaitMicros);
+            statusReg = readRegister(STATUS);
+
+            if (statusReg & _BV(TX_DS))
+            {
+                writeRegister(STATUS, statusReg | _BV(TX_DS));   // Clear TX success flag.
+                return 1;                                        // Return success.
+            }
+            else if (statusReg & _BV(MAX_RT))
+            {
+                spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0); // Clear TX FIFO buffer.
+                writeRegister(STATUS, statusReg | _BV(MAX_RT));  // Clear flag which indicates max retries has been reached.
+                return 0;                                        // Return failure.
+            }
         }
     }
 }
@@ -225,7 +293,7 @@ uint8_t NRFLite::send(uint8_t toRadioId, void *data, uint8_t length, SendType se
 void NRFLite::startSend(uint8_t toRadioId, void *data, uint8_t length, SendType sendType)
 {
     prepForTx(toRadioId, sendType);
-    
+
     // Add data to the TX FIFO buffer, with or without an ACK request.
     if (sendType == NO_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
     else                    { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD       , data, length); }
@@ -270,14 +338,11 @@ void NRFLite::printDetails()
     printRegister("CONFIG", readRegister(CONFIG));
     printRegister("EN_AA", readRegister(EN_AA));
     printRegister("EN_RXADDR", readRegister(EN_RXADDR));
-    printRegister("SETUP_AW", readRegister(SETUP_AW));
     printRegister("SETUP_RETR", readRegister(SETUP_RETR));
     printRegister("RF_CH", readRegister(RF_CH));
     printRegister("RF_SETUP", readRegister(RF_SETUP));
     printRegister("STATUS", readRegister(STATUS));
     printRegister("OBSERVE_TX", readRegister(OBSERVE_TX));
-    printRegister("RX_PW_P0", readRegister(RX_PW_P0));
-    printRegister("RX_PW_P1", readRegister(RX_PW_P1));
     printRegister("FIFO_STATUS", readRegister(FIFO_STATUS));
     printRegister("DYNPD", readRegister(DYNPD));
     printRegister("FEATURE", readRegister(FEATURE));
@@ -286,18 +351,23 @@ void NRFLite::printDetails()
     
     String msg = "TX_ADDR ";
     readRegister(TX_ADDR, &data, 5);
-    for (uint8_t i = 0; i < 4; i++) { msg += data[i]; msg += ','; }
-    msg += data[4];
+    for (uint8_t i = 4; i > 0; i--) { msg += data[i]; msg += ','; }
+    msg += data[0];
     
     msg += "\nRX_ADDR_P0 ";
     readRegister(RX_ADDR_P0, &data, 5);
-    for (uint8_t i = 0; i < 4; i++) { msg += data[i]; msg += ','; }
-    msg += data[4];
+    for (uint8_t i = 4; i > 0; i--) { msg += data[i]; msg += ','; }
+    msg += data[0];
 
     msg += "\nRX_ADDR_P1 ";
     readRegister(RX_ADDR_P1, &data, 5);
-    for (uint8_t i = 0; i < 4; i++) { msg += data[i]; msg += ','; }
-    msg += data[4];
+    for (uint8_t i = 4; i > 0; i--) { msg += data[i]; msg += ','; }
+    msg += data[0];
+
+    msg += "\nRX_ADDR_P2 ";
+    readRegister(RX_ADDR_P1, &data, 5);
+    for (uint8_t i = 4; i > 0; i--) { msg += data[i]; msg += ','; }
+    msg += readRegister(RX_ADDR_P2);
 
     debugln(msg);
 }
@@ -317,11 +387,10 @@ uint8_t NRFLite::getPipeOfFirstRxPacket()
 
 uint8_t NRFLite::getRxPacketLength()
 {
-    // Read the length of the first data packet sitting in the RX FIFO buffer.
+    // Read the length of the first packet sitting in the RX FIFO buffer.
     uint8_t dataLength;
     spiTransfer(READ_OPERATION, R_RX_PL_WID, &dataLength, 1);
 
-    // Verify the data length is valid (0 - 32 bytes).
     if (dataLength > 32)
     {
         spiTransfer(WRITE_OPERATION, FLUSH_RX, NULL, 0); // Clear invalid data in the RX FIFO buffer.
@@ -336,13 +405,9 @@ uint8_t NRFLite::getRxPacketLength()
 
 uint8_t NRFLite::prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel)
 {
-    _resetInterruptFlags = 1;
-
     delay(OFF_TO_POWERDOWN_MILLIS);
 
-    // Valid channel range is 2400 - 2525 MHz, in 1 MHz increments.
-    if (channel > 125) { channel = 125; }
-    writeRegister(RF_CH, channel);
+    _resetInterruptFlags = 1;
 
     // Transmission speed, retry times, and output power setup.
     // For 2 Mbps or 1 Mbps operation, a 500 uS retry time is necessary to support the max ACK packet size.
@@ -371,20 +436,30 @@ uint8_t NRFLite::prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel)
     {                                         
         writeRegister(RF_SETUP, B00100110);   // 250 Kbps, 0 dBm output power
         writeRegister(SETUP_RETR, B01011111); // 0101 = 1500 uS between retries, 1111 = 15 retries
-        _maxHasDataIntervalMicros = 8000;     
-        _transmissionRetryWaitMicros = 1500;  
+        _maxHasDataIntervalMicros = 8000;
+        _transmissionRetryWaitMicros = 1500;
     }
 
-    // Assign this radio's address to RX pipe 1.  When another radio sends us data, this is the address
-    // it will use.  We use RX pipe 1 to store our address since the address in RX pipe 0 is reserved
-    // for use with auto-acknowledgment packets.
-    uint8_t address[5] = { 1, 2, 3, 4, radioId };
-    writeRegister(RX_ADDR_P1, &address, 5);
+    // Valid channel range is 2400 - 2525 MHz, in 1 MHz increments.
+    if (channel > 125) { channel = 125; }
+    writeRegister(RF_CH, channel);
 
-    // Enable dynamically sized packets on the 2 RX pipes we use, 0 and 1.
-    // RX pipe address 1 is used to for normal packets from radios that send us data.
-    // RX pipe address 0 is used to for auto-acknowledgment packets from radios we transmit to.
-    writeRegister(DYNPD, _BV(DPL_P0) | _BV(DPL_P1));
+    // Enable RX pipes and enable dynamically sized packets.
+    // Pipe 0 = receives ACK and ACK packets (hardware-based ACK packets).
+    // Pipe 1 = receives REQUIRE_ACK and NO_ACK packets.
+    // Pipe 2 = receives REQUIRE_SACK packets (software-based ACK packets).
+    writeRegister(EN_RXADDR, _BV(ERX_P0) | _BV(ERX_P1) | _BV(ERX_P2));
+    writeRegister(DYNPD, _BV(DPL_P0) | _BV(DPL_P1) | _BV(DPL_P2));
+
+    // Assign radio addresses.
+    // Pipe 1 uses the provided radio id.
+    // Pipe 2 uses the provided radio id, plus 100.  If we receive a packet for this address,
+    // we know we are dealing with a software-based ACK packet and will perform software-based acknowledgement.
+    if (radioId > 99) { radioId = 99; } // Limit valid radio id range 0 - 99.
+    _radioId = radioId;
+    uint8_t address[5] = { _radioId, 40, 30, 20, 10 };
+    writeRegister(RX_ADDR_P1, &address, 5);
+    writeRegister(RX_ADDR_P2, _radioId + 100);
 
     // Enable dynamically sized payloads, ACK payloads, and TX support with or without an ACK request.
     writeRegister(FEATURE, _BV(EN_DPL) | _BV(EN_ACK_PAY) | _BV(EN_DYN_ACK));
@@ -398,7 +473,7 @@ uint8_t NRFLite::prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel)
     writeRegister(STATUS, statusReg | _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT));
 
     // Power on the radio and start listening, delaying to allow startup to complete.
-    uint8_t newConfigReg = _BV(PWR_UP) | _BV(PRIM_RX) | _BV(EN_CRC);
+    uint8_t newConfigReg = _BV(EN_CRC) | _BV(PWR_UP) | _BV(PRIM_RX);
     writeRegister(CONFIG, newConfigReg);
     digitalWrite(_cePin, HIGH);
     delayMicroseconds(POWERDOWN_TO_RXTX_MODE_MICROS);
@@ -409,44 +484,53 @@ uint8_t NRFLite::prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel)
 
 void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
 {
+    if (sendType == REQUIRE_SACK)
+    {
+        toRadioId += 100; // Send to the receiving radio's pipe 2 address to indicate it must send a software-based ACK.
+    }
+
     if (toRadioId != _lastToRadioId)
     {
-        // TX pipe address sets the destination radio for the data.
-        // RX pipe 0 is special and needs the same address in order to receive ACK packets from the destination radio.
-       _lastToRadioId = toRadioId;
-        uint8_t address[5] = { 1, 2, 3, 4, toRadioId };
-        writeRegister(TX_ADDR, &address, 5);
-        writeRegister(RX_ADDR_P0, &address, 5);
+        _lastToRadioId = toRadioId;
+        uint8_t address[5] = { toRadioId, 40, 30, 20, 10 };
+        writeRegister(TX_ADDR, &address, 5);    // Transmit to the radio with this address.
+        writeRegister(RX_ADDR_P0, &address, 5); // Receive hardware-based ACK on pipe 0.
     }
 
     // Ensure radio is powered on and ready for TX operation.
-    uint8_t originalConfigReg = readRegister(CONFIG);
-    uint8_t newConfigReg = originalConfigReg & ~_BV(PRIM_RX) | _BV(PWR_UP);
-    if (originalConfigReg != newConfigReg)
+    uint8_t configReg = readRegister(CONFIG);
+    uint8_t newConfigReg = configReg & ~_BV(PRIM_RX) | _BV(PWR_UP);
+    if (configReg != newConfigReg)
     {
         // In case the radio was in RX mode (powered on and listening), we'll put the radio into
         // Standby-I mode by setting CE LOW.  The radio cannot transition directly from RX to TX,
         // it must go through Standby-I first.
-        if ((originalConfigReg & _BV(PRIM_RX)) && (originalConfigReg & _BV(PWR_UP)))
+        if ((configReg & _BV(PRIM_RX)) && (configReg & _BV(PWR_UP)))
         {
             if (digitalRead(_cePin) == HIGH) { digitalWrite(_cePin, LOW); }
         }
         
         writeRegister(CONFIG, newConfigReg);
-        delayMicroseconds(POWERDOWN_TO_RXTX_MODE_MICROS);
+        delayMicroseconds(STANDBY_TO_RXTX_MODE_MICROS);
+
+        // If radio was powered off, wait for it to turn on.
+        if ((configReg & _BV(PWR_UP)) == 0)
+        {
+            delayMicroseconds(POWERDOWN_TO_RXTX_MODE_MICROS);
+        }
     }
     
     // If RX FIFO buffer is full and we require an ACK, clear it so we can receive the ACK response.
     uint8_t fifoReg = readRegister(FIFO_STATUS);
-    if (fifoReg & _BV(RX_FULL) && sendType == REQUIRE_ACK)
+    if (fifoReg & _BV(RX_FULL) && (sendType == REQUIRE_ACK || sendType == REQUIRE_SACK))
     {
         spiTransfer(WRITE_OPERATION, FLUSH_RX, NULL, 0);
     }
-    
+
     // If TX FIFO buffer is full, we'll attempt to send all the packets it contains.
     if (fifoReg & _BV(FIFO_FULL))
     {
-        // Disable interrupt flag reset logic in 'whatHappened' so we can react to the flags here.
+        // Disable interrupt flag reset logic in 'whatHappened' so we can use the flags here.
         _resetInterruptFlags = 0;
         uint8_t statusReg;
         
@@ -460,7 +544,7 @@ void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
             
             delayMicroseconds(_transmissionRetryWaitMicros);
             statusReg = readRegister(STATUS);
-            
+
             if (statusReg & _BV(TX_DS))
             {
                 writeRegister(STATUS, statusReg | _BV(TX_DS));   // Clear TX success flag.
@@ -476,6 +560,134 @@ void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
         
         _resetInterruptFlags = 1;
     }
+}
+
+uint8_t NRFLite::getRequireSackData()
+{
+    _requireSackDataLength = getRxPacketLength();
+
+    if (_requireSackDataLength > 0)
+    {
+        // Read data from RX FIFO buffer.
+        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_requireSackData, _requireSackDataLength);
+
+        // Clear data received flag.
+        writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR)); 
+
+        delay(SACK_TX_TO_RX_MILLIS); // Wait for transmitter (who sent this data) to become a receiver.
+
+        if (_sackDataLength > 0)
+        {
+            // Send user-provided data as part of the SACK packet (user added it via 'addAckData').
+            uint8_t fromRadioId = _requireSackData[0];
+            send(fromRadioId, &_sackData, _sackDataLength, NRFLite::NO_ACK);
+        }
+        else
+        {
+            // Send a non-data SACK packet.  It contains only our radio id and the id of the packet we are acknowledging.
+            uint8_t fromRadioId = _requireSackData[0];
+            uint8_t dataId = _requireSackData[1];
+            uint16_t nonDataPacketId = _radioId << 8 | dataId;
+            send(fromRadioId, &nonDataPacketId, 2, NRFLite::NO_ACK);
+        }
+    }
+
+    // Ignore the packet if we already received it.
+    uint16_t receivedPacketId = _requireSackData[0] << 8 | _requireSackData[1];
+    if (receivedPacketId == _lastPacketId)
+    {
+        _requireSackDataLength = 0;
+        return 0;
+    }
+    else
+    {
+        _lastPacketId = receivedPacketId;
+        return _requireSackDataLength - 2; // Exclude the 2 byte packet id.
+    }
+}
+
+uint8_t NRFLite::sendRequireSackData(uint8_t toRadioId, void *data, uint8_t length)
+{
+    if (length > 30) length = 30; // Limit user's data to 30 bytes.
+
+    // Create a byte array for the REQUIRE_SACK (software-based acknowledgement) packet to send.
+    // Byte 0 = our radio id, byte 1 = data id, bytes 2-32 are the user's data.
+    // The receiver uses byte 0 to know where it should transmit back the acknowledgement and byte 1
+    // to know if it has already received the data and should ignore it.
+    uint8_t sackData[length + 2];
+    sackData[0] = _radioId;
+    sackData[1] = _lastRequireSackDataId++;
+    uint8_t* intData = reinterpret_cast<uint8_t*>(data);
+    for (uint8_t i = 0; i < length; i++)
+    {
+        sackData[i + 2] = intData[i];
+    }
+
+    uint8_t retryCount = 0, successFlag = 0;
+    _sackDataLength = 0; // Stores the size of any SACK packet returned by the receiver.
+
+    while (retryCount++ < 16)
+    {
+        // Clear any previously asserted TX flags.
+        uint8_t statusReg = readRegister(STATUS);
+        if (statusReg & _BV(TX_DS) || statusReg & _BV(MAX_RT))
+        {
+            writeRegister(STATUS, statusReg | _BV(TX_DS) | _BV(MAX_RT));
+        }
+
+        // Change to TX operation and send data.
+        prepForTx(toRadioId, REQUIRE_SACK);
+        spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0);
+        spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, sackData, length + 2);
+
+        if (_cePin != _csnPin)
+        {
+            digitalWrite(_cePin, HIGH);
+            delayMicroseconds(CE_TRANSMISSION_MICROS);
+            digitalWrite(_cePin, LOW);
+        }
+        
+        delay(SACK_TX_COMPLETE_MILLIS);
+
+        // Change to RX operation.
+        writeRegister(CONFIG, readRegister(CONFIG) | _BV(PRIM_RX));
+
+        if (_cePin != _csnPin)
+        {
+            if (digitalRead(_cePin) == LOW) digitalWrite(_cePin, HIGH);
+        }
+
+        delay(SACK_RX_WAIT_TIME_MILLIS);
+
+        if (getPipeOfFirstRxPacket() == 1) // Receiver transmits acknowledgement back to our pipe 1 address.
+        {
+            successFlag = 1;
+            _sackDataLength = getRxPacketLength();
+
+            if (_sackDataLength == 2)
+            {
+                // Receiver sent a SACK packet that contained no user data.
+                spiTransfer(WRITE_OPERATION, FLUSH_RX, NULL, 0);
+                writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR));
+                _sackDataLength = 0; // Clear the indication of SACK data.
+            }
+            else
+            {
+                // Receiver sent a SACK packet containing user data.
+                // The transmitter will be able to check for this data using 'hasAckData'.
+                spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_sackData, _sackDataLength);
+            }
+            
+            break;
+        }
+    }
+
+    if (!successFlag)
+    {
+        spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0); // Clear TX FIFO buffer.
+    }
+
+    return successFlag;
 }
 
 uint8_t NRFLite::readRegister(uint8_t regName)
@@ -592,11 +804,10 @@ void NRFLite::printRegister(char name[], uint8_t reg)
     String msg = name;
     msg += " ";
 
-    uint8_t i = 8;
-    do
+    for (int8_t i = 7; i >= 0; i--)
     {
-        msg += bitRead(reg, --i);
+        msg += bitRead(reg, i);
     }
-    while (i);
+
     debugln(msg);
 }

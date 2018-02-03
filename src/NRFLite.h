@@ -7,7 +7,7 @@
 class NRFLite {
 
   public:
-    
+
     // Constructors
     // Optionally pass in an Arduino Serial or SoftwareSerial object for use throughout the library when debugging.
     // Use the debug and debugln DEFINES in NRFLite.cpp to use the serial object.
@@ -15,7 +15,7 @@ class NRFLite {
     NRFLite(Stream &serial) : _serial(&serial) {}
     
     enum Bitrates { BITRATE2MBPS, BITRATE1MBPS, BITRATE250KBPS };
-    enum SendType { REQUIRE_ACK, NO_ACK };
+    enum SendType { REQUIRE_ACK, NO_ACK, REQUIRE_SACK };
     
     // Methods for receivers and transmitters.
     // init       = Turns the radio on and puts it into receiving mode.  Returns 0 if it cannot communicate with the radio.
@@ -48,10 +48,11 @@ class NRFLite {
     // Methods for receivers.
     // hasData    = Checks to see if a data packet has been received and returns its length.
     // addAckData = Enqueues an acknowledgment packet for sending back to a transmitter.  Whenever the transmitter sends the 
-    //              next data packet, it will get this ACK packet back in the response.  The radio will store up to 3 ACK packets
-    //              and will not enqueue more if full, so you can clear any stale packets using the 'removeExistingAcks' parameter.
+    //              next data packet, it will get this ACK packet back in the response.
+    // removeAckData = Removes any acknowledgement packet loaded into the transmitter.
     uint8_t hasData(uint8_t usingInterrupts = 0);
-    void addAckData(void *data, uint8_t length, uint8_t removeExistingAcks = 0); 
+    void addAckData(void *data, uint8_t length);
+    void removeAckData();
     
     // Methods when using the radio's IRQ pin for interrupts.
     // Note that if interrupts are used, do not use the send and hasData functions.  Instead the functions below must be used.
@@ -70,8 +71,14 @@ class NRFLite {
     const static uint16_t CSN_DISCHARGE_MICROS = 500;
 
     const static uint8_t OFF_TO_POWERDOWN_MILLIS = 100; // Vcc > 1.9V power on reset time.
-    const static uint16_t POWERDOWN_TO_RXTX_MODE_MICROS = 4630; // 4500 to Standby + 130 to RX or TX mode.
-    const static uint8_t CE_TRANSMISSION_MICROS = 10; // Time to initiate data transmission.
+    const static uint8_t STANDBY_TO_RXTX_MODE_MICROS = 130; // Standby to RX or TX mode time.
+    const static uint16_t POWERDOWN_TO_RXTX_MODE_MICROS = 4500 + STANDBY_TO_RXTX_MODE_MICROS;
+    const static uint8_t CE_TRANSMISSION_MICROS = 11; // Time to initiate data transmission.
+
+    // Determined by ensuring all available packet sizes can be sent and received at all bitrates.
+    const static uint8_t SACK_TX_COMPLETE_MILLIS = 10; // Time to wait for TX to complete.
+    const static uint8_t SACK_TX_TO_RX_MILLIS = SACK_TX_COMPLETE_MILLIS + 10; // Time for transmitter to become a receiver.
+    const static uint8_t SACK_RX_WAIT_TIME_MILLIS = SACK_TX_TO_RX_MILLIS + 10; // Time to wait for reception of the SACK packet.
 
     enum SpiTransferType { READ_OPERATION, WRITE_OPERATION };
 
@@ -82,14 +89,21 @@ class NRFLite {
     volatile uint8_t *_sck_PORT;
     uint8_t _cePin, _csnPin, _momi_MASK, _sck_MASK;
     uint8_t _resetInterruptFlags, _useTwoPinSpiTransfer;
+    uint8_t _radioId;
     int16_t _lastToRadioId = -1;
     uint16_t _transmissionRetryWaitMicros, _maxHasDataIntervalMicros;
     uint32_t _microsSinceLastDataCheck;
+    uint8_t _useSack;
+    uint8_t _sackData[32], _sackDataLength, _lastSackDataId;
+    uint8_t _requireSackData[32], _requireSackDataLength, _lastRequireSackDataId;
+    uint16_t _lastPacketId;
     
     uint8_t getPipeOfFirstRxPacket();
     uint8_t getRxPacketLength();
     uint8_t prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel);
     void prepForTx(uint8_t toRadioId, SendType sendType);
+    uint8_t getRequireSackData();
+    uint8_t sendRequireSackData(uint8_t toRadioId, void *data, uint8_t length);
     uint8_t readRegister(uint8_t regName);
     void readRegister(uint8_t regName, void* data, uint8_t length);
     void writeRegister(uint8_t regName, uint8_t data);
@@ -97,7 +111,6 @@ class NRFLite {
     void spiTransfer(SpiTransferType transferType, uint8_t regName, void* data, uint8_t length);
     uint8_t usiTransfer(uint8_t data);    
     uint8_t twoPinTransfer(uint8_t data);
-
     void printRegister(char name[], uint8_t regName);
 };
 
