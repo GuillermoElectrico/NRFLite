@@ -489,13 +489,9 @@ void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
         toRadioId += 100; // Send to the receiving radio's pipe 2 address to indicate it must send a software-based ACK.
     }
 
-    if (toRadioId != _lastToRadioId)
-    {
-        _lastToRadioId = toRadioId;
-        uint8_t address[5] = { toRadioId, 40, 30, 20, 10 };
-        writeRegister(TX_ADDR, &address, 5);    // Transmit to the radio with this address.
-        writeRegister(RX_ADDR_P0, &address, 5); // Receive hardware-based ACK on pipe 0.
-    }
+    uint8_t address[5] = { toRadioId, 40, 30, 20, 10 };
+    writeRegister(TX_ADDR, &address, 5);    // Transmit to the radio with this address.
+    writeRegister(RX_ADDR_P0, &address, 5); // Receive hardware-based ACK on pipe 0.
 
     // Ensure radio is powered on and ready for TX operation.
     uint8_t configReg = readRegister(CONFIG);

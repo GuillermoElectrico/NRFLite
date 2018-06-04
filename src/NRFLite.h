@@ -90,7 +90,6 @@ class NRFLite {
     uint8_t _cePin, _csnPin, _momi_MASK, _sck_MASK;
     uint8_t _resetInterruptFlags, _useTwoPinSpiTransfer;
     uint8_t _radioId;
-    int16_t _lastToRadioId = -1;
     uint16_t _transmissionRetryWaitMicros, _maxHasDataIntervalMicros;
     uint32_t _microsSinceLastDataCheck;
     uint8_t _useSack;
