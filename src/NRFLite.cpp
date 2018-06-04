@@ -314,7 +314,7 @@ void NRFLite::whatHappened(uint8_t &txOk, uint8_t &txFail, uint8_t &rxReady)
     txOk = statusReg & _BV(TX_DS);
     txFail = statusReg & _BV(MAX_RT);
     rxReady = statusReg & _BV(RX_DR);
-    
+
     // When we need to see interrupt flags, we disable the logic here which clears them.
     // Programs that have an interrupt handler for the radio's IRQ pin will use 'whatHappened'
     // and if we don't disable this logic, it's not possible for us to check these flags.
@@ -445,7 +445,7 @@ uint8_t NRFLite::prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel)
     writeRegister(RF_CH, channel);
 
     // Enable RX pipes and enable dynamically sized packets.
-    // Pipe 0 = receives ACK and ACK packets (hardware-based ACK packets).
+    // Pipe 0 = receives ACK packets (hardware-based ACK packets).
     // Pipe 1 = receives REQUIRE_ACK and NO_ACK packets.
     // Pipe 2 = receives REQUIRE_SACK packets (software-based ACK packets).
     writeRegister(EN_RXADDR, _BV(ERX_P0) | _BV(ERX_P1) | _BV(ERX_P2));
