@@ -94,15 +94,15 @@ class NRFLite {
     uint32_t _microsSinceLastDataCheck;
     uint8_t _useSack;
     uint8_t _sackData[32], _sackDataLength, _lastSackDataId;
-    uint8_t _requireSackData[32], _requireSackDataLength, _lastRequireSackDataId;
+    uint8_t _requireSackData[32], _receivedDataLength, _lastRequireSackDataId;
     uint16_t _lastPacketId;
     
     uint8_t getPipeOfFirstRxPacket();
     uint8_t getRxPacketLength();
     uint8_t prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel);
     void prepForTx(uint8_t toRadioId, SendType sendType);
-    uint8_t getRequireSackData();
-    uint8_t sendRequireSackData(uint8_t toRadioId, void *data, uint8_t length);
+    uint8_t getSackDataLengthAndSendAck();
+    uint8_t sendSackData(uint8_t toRadioId, void *data, uint8_t length);
     uint8_t readRegister(uint8_t regName);
     void readRegister(uint8_t regName, void* data, uint8_t length);
     void writeRegister(uint8_t regName, uint8_t data);

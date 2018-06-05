@@ -186,7 +186,7 @@ uint8_t NRFLite::hasData(uint8_t usingInterrupts)
     else if (pipe == 2) // Pipe 2 receives REQUIRE_SACK packets (software-based ACK packets).
     {
         _useSack = 1;
-        return getRequireSackData();
+        return getSackDataLengthAndSendAck();
     }
     else
     {
@@ -204,15 +204,15 @@ uint8_t NRFLite::hasDataISR()
 
 void NRFLite::readData(void *data)
 {
-    if (_requireSackDataLength > 0)
+    if (_receivedDataLength > 0)
     {
         // Receiver received a REQUIRE_SACK packet and is reading it.
         uint8_t* intData = reinterpret_cast<uint8_t*>(data);
-        for (uint8_t i = 0; i < _requireSackDataLength - 2; i++)
+        for (uint8_t i = 0; i < _receivedDataLength - 2; i++)
         {
             intData[i] = _requireSackData[i + 2];
         }
-        _requireSackDataLength = 0;
+        _receivedDataLength = 0;
     }
     else if (_sackDataLength > 0)
     {
@@ -250,7 +250,7 @@ uint8_t NRFLite::send(uint8_t toRadioId, void *data, uint8_t length, SendType se
     if (sendType == REQUIRE_SACK) 
     {
         // Send the data and wait for a SACK packet (software-based ACK packet).
-        return sendRequireSackData(toRadioId, data, length);
+        return sendSackData(toRadioId, data, length);
     }
     else
     {
@@ -558,33 +558,33 @@ void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
     }
 }
 
-uint8_t NRFLite::getRequireSackData()
+uint8_t NRFLite::getSackDataLengthAndSendAck()
 {
-    _requireSackDataLength = getRxPacketLength();
+    _receivedDataLength = getRxPacketLength();
 
-    if (_requireSackDataLength > 0)
+    if (_receivedDataLength > 0)
     {
         // Read data from RX FIFO buffer.
-        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_requireSackData, _requireSackDataLength);
+        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_requireSackData, _receivedDataLength);
 
         // Clear data received flag.
         writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR)); 
 
-        delay(SACK_TX_TO_RX_MILLIS); // Wait for transmitter (who sent this data) to become a receiver.
+        delay(SACK_TX_TO_RX_MILLIS); // Wait for transmitter to become a receiver.
 
         if (_sackDataLength > 0)
         {
-            // Send user-provided data as part of the SACK packet (user added it via 'addAckData').
-            uint8_t fromRadioId = _requireSackData[0];
-            send(fromRadioId, &_sackData, _sackDataLength, NRFLite::NO_ACK);
+            // Send user-provided data (added via 'addAckData').
+            uint8_t toRadioId = _requireSackData[0];
+            send(toRadioId, &_sackData, _sackDataLength, NRFLite::NO_ACK);
         }
         else
         {
-            // Send a non-data SACK packet.  It contains only our radio id and the id of the packet we are acknowledging.
-            uint8_t fromRadioId = _requireSackData[0];
+            // Send non-data packet (only contains our radio id and the packet id being acknowledged).
+            uint8_t toRadioId = _requireSackData[0];
             uint8_t dataId = _requireSackData[1];
             uint16_t nonDataPacketId = _radioId << 8 | dataId;
-            send(fromRadioId, &nonDataPacketId, 2, NRFLite::NO_ACK);
+            send(toRadioId, &nonDataPacketId, 2, NRFLite::NO_ACK);
         }
     }
 
@@ -592,17 +592,17 @@ uint8_t NRFLite::getRequireSackData()
     uint16_t receivedPacketId = _requireSackData[0] << 8 | _requireSackData[1];
     if (receivedPacketId == _lastPacketId)
     {
-        _requireSackDataLength = 0;
+        _receivedDataLength = 0;
         return 0;
     }
     else
     {
         _lastPacketId = receivedPacketId;
-        return _requireSackDataLength - 2; // Exclude the 2 byte packet id.
+        return _receivedDataLength - 2; // Exclude the 2 byte packet id.
     }
 }
 
-uint8_t NRFLite::sendRequireSackData(uint8_t toRadioId, void *data, uint8_t length)
+uint8_t NRFLite::sendSackData(uint8_t toRadioId, void *data, uint8_t length)
 {
     if (length > 30) length = 30; // Limit user's data to 30 bytes.
 
@@ -662,14 +662,14 @@ uint8_t NRFLite::sendRequireSackData(uint8_t toRadioId, void *data, uint8_t leng
 
             if (_sackDataLength == 2)
             {
-                // Receiver sent a SACK packet that contained no user data.
+                // Received non-data packet.
                 spiTransfer(WRITE_OPERATION, FLUSH_RX, NULL, 0);
                 writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR));
                 _sackDataLength = 0; // Clear the indication of SACK data.
             }
             else
             {
-                // Receiver sent a SACK packet containing user data.
+                // Received data-bearing SACK packet.
                 // The transmitter will be able to check for this data using 'hasAckData'.
                 spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_sackData, _sackDataLength);
             }
