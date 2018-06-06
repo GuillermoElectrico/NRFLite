@@ -81,14 +81,14 @@ void NRFLite::addAckData(void *data, uint8_t length)
         if (length > 30) length = 30; // Limit user's data to 30 bytes.
         
         // Store data in the byte array used when transmitting SACK packets.
-        _sackData[0] = _radioId;
-        _sackData[1] = _lastSackDataId++;
-        _sackDataLength = length + 2;
+        _ackDataPacket[0] = _radioId;
+        _ackDataPacket[1] = _lastPacketId++;
+        _ackDataLength = length + 2;
 
         uint8_t* intData = reinterpret_cast<uint8_t*>(data);
         for (uint8_t i = 0; i < length; i++)
         {
-            _sackData[i + 2] = intData[i];
+            _ackDataPacket[i + 2] = intData[i];
         }
     }
     else
@@ -108,7 +108,7 @@ void NRFLite::removeAckData()
 {
     if (_useSack)
     {
-        _sackDataLength = 0;
+        _ackDataLength = 0;
     }
     else
     {
@@ -118,9 +118,9 @@ void NRFLite::removeAckData()
 
 uint8_t NRFLite::hasAckData()
 {
-    if (_sackDataLength > 0)
+    if (_ackDataLength > 0)
     {
-        return _sackDataLength - 2; // Exclude the 2 byte packet id.
+        return _ackDataLength - 2; // Exclude the 2 byte packet header.
     }
     else if (getPipeOfFirstRxPacket() == 0) // Pipe 0 receives hardware-based ACK packets.
     {
@@ -186,7 +186,7 @@ uint8_t NRFLite::hasData(uint8_t usingInterrupts)
     else if (pipe == 2) // Pipe 2 receives REQUIRE_SACK packets (software-based ACK packets).
     {
         _useSack = 1;
-        return getSackDataLengthAndSendAck();
+        return getRxPacketLengthAndSendSack();
     }
     else
     {
@@ -210,19 +210,19 @@ void NRFLite::readData(void *data)
         uint8_t* intData = reinterpret_cast<uint8_t*>(data);
         for (uint8_t i = 0; i < _receivedDataLength - 2; i++)
         {
-            intData[i] = _requireSackData[i + 2];
+            intData[i] = _receivedDataPacket[i + 2];
         }
         _receivedDataLength = 0;
     }
-    else if (_sackDataLength > 0)
+    else if (_ackDataLength > 0)
     {
         // Transmitter received a SACK packet and is reading it.
         uint8_t* intData = reinterpret_cast<uint8_t*>(data);
-        for (uint8_t i = 0; i < _sackDataLength - 2; i++)
+        for (uint8_t i = 0; i < _ackDataLength - 2; i++)
         {
-            intData[i] = _sackData[i + 2];
+            intData[i] = _ackDataPacket[i + 2];
         }
-        _sackDataLength = 0;
+        _ackDataLength = 0;
     }
     else
     {
@@ -250,25 +250,11 @@ uint8_t NRFLite::send(uint8_t toRadioId, void *data, uint8_t length, SendType se
     if (sendType == REQUIRE_SACK) 
     {
         // Send the data and wait for a SACK packet (software-based ACK packet).
-        return sendSackData(toRadioId, data, length);
+        return sendAndWaitForSack(toRadioId, data, length);
     }
     else
     {
-        prepForTx(toRadioId, sendType);
-
-        if (sendType == REQUIRE_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD, data, length); }
-        else if (sendType == NO_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
-
-        // Start transmission.
-        // If we have separate pins for CE and CSN, CE will be LOW and we must pulse it to start transmission.
-        // If we use the same pin for CE and CSN, CE will already be HIGH and transmission will have started
-        // when data was loaded into the TX FIFO buffer.
-        if (_cePin != _csnPin)
-        {
-            digitalWrite(_cePin, HIGH);
-            delayMicroseconds(CE_TRANSMISSION_MICROS);
-            digitalWrite(_cePin, LOW);
-        }
+        startSend(toRadioId, data, length, sendType);
 
         while (1)
         {
@@ -295,10 +281,14 @@ void NRFLite::startSend(uint8_t toRadioId, void *data, uint8_t length, SendType 
     prepForTx(toRadioId, sendType);
 
     // Add data to the TX FIFO buffer, with or without an ACK request.
-    if (sendType == NO_ACK) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
-    else                    { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD       , data, length); }
+    if      (sendType == NO_ACK)        { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
+    else if (sendType == REQUIRE_SACK ) { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, data, length); }
+    else                                { spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD       , data, length); }
     
     // Start transmission.
+    // If we have separate pins for CE and CSN, CE will be LOW and we must pulse it to start transmission.
+    // If we use the same pin for CE and CSN, CE will already be HIGH and transmission will have started
+    // when data was loaded into the TX FIFO buffer.
     if (_cePin != _csnPin)
     {
         digitalWrite(_cePin, HIGH);
@@ -558,61 +548,60 @@ void NRFLite::prepForTx(uint8_t toRadioId, SendType sendType)
     }
 }
 
-uint8_t NRFLite::getSackDataLengthAndSendAck()
+uint8_t NRFLite::getRxPacketLengthAndSendSack()
 {
     _receivedDataLength = getRxPacketLength();
 
     if (_receivedDataLength > 0)
     {
-        // Read data from RX FIFO buffer.
-        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_requireSackData, _receivedDataLength);
-
-        // Clear data received flag.
+        // Read data and clear flag.
+        spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_receivedDataPacket, _receivedDataLength);
         writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR)); 
 
-        delay(SACK_TX_TO_RX_MILLIS); // Wait for transmitter to become a receiver.
+        // Send acknowledgement.
+        delay(SACK_TX_TO_RX_MILLIS);
 
-        if (_sackDataLength > 0)
+        if (_ackDataLength > 0)
         {
             // Send user-provided data (added via 'addAckData').
-            uint8_t toRadioId = _requireSackData[0];
-            send(toRadioId, &_sackData, _sackDataLength, NRFLite::NO_ACK);
+            uint8_t toRadioId = _receivedDataPacket[0];
+            send(toRadioId, &_ackDataPacket, _ackDataLength, NRFLite::NO_ACK);
         }
         else
         {
             // Send non-data packet (only contains our radio id and the packet id being acknowledged).
-            uint8_t toRadioId = _requireSackData[0];
-            uint8_t dataId = _requireSackData[1];
-            uint16_t nonDataPacketId = _radioId << 8 | dataId;
-            send(toRadioId, &nonDataPacketId, 2, NRFLite::NO_ACK);
+            uint8_t toRadioId = _receivedDataPacket[0];
+            uint8_t packetId = _receivedDataPacket[1];
+            uint16_t packet = _radioId << 8 | packetId;
+            send(toRadioId, &packet, 2, NRFLite::NO_ACK);
         }
     }
 
     // Ignore the packet if we already received it.
-    uint16_t receivedPacketId = _requireSackData[0] << 8 | _requireSackData[1];
-    if (receivedPacketId == _lastPacketId)
+    uint16_t receivedPacketHeader = _receivedDataPacket[0] << 8 | _receivedDataPacket[1];
+    if (receivedPacketHeader == _lastReceivedPacketHeader)
     {
         _receivedDataLength = 0;
         return 0;
     }
     else
     {
-        _lastPacketId = receivedPacketId;
-        return _receivedDataLength - 2; // Exclude the 2 byte packet id.
+        _lastReceivedPacketHeader = receivedPacketHeader;
+        return _receivedDataLength - 2; // Exclude the 2 byte header.
     }
 }
 
-uint8_t NRFLite::sendSackData(uint8_t toRadioId, void *data, uint8_t length)
+uint8_t NRFLite::sendAndWaitForSack(uint8_t toRadioId, void *data, uint8_t length)
 {
     if (length > 30) length = 30; // Limit user's data to 30 bytes.
 
     // Create a byte array for the REQUIRE_SACK (software-based acknowledgement) packet to send.
-    // Byte 0 = our radio id, byte 1 = data id, bytes 2-32 are the user's data.
+    // Byte 0 = our radio id, byte 1 = packet id, bytes 2-32 are the user's data.
     // The receiver uses byte 0 to know where it should transmit back the acknowledgement and byte 1
-    // to know if it has already received the data and should ignore it.
+    // to know if it already received the data and should ignore it.
     uint8_t sackData[length + 2];
     sackData[0] = _radioId;
-    sackData[1] = _lastRequireSackDataId++;
+    sackData[1] = _lastPacketId++;
     uint8_t* intData = reinterpret_cast<uint8_t*>(data);
     for (uint8_t i = 0; i < length; i++)
     {
@@ -620,7 +609,7 @@ uint8_t NRFLite::sendSackData(uint8_t toRadioId, void *data, uint8_t length)
     }
 
     uint8_t retryCount = 0, successFlag = 0;
-    _sackDataLength = 0; // Stores the size of any SACK packet returned by the receiver.
+    _ackDataLength = 0; // Stores the size of any data-bearing ACK packet returned by the receiver.
 
     while (retryCount++ < 16)
     {
@@ -632,46 +621,37 @@ uint8_t NRFLite::sendSackData(uint8_t toRadioId, void *data, uint8_t length)
         }
 
         // Change to TX operation and send data.
-        prepForTx(toRadioId, REQUIRE_SACK);
         spiTransfer(WRITE_OPERATION, FLUSH_TX, NULL, 0);
-        spiTransfer(WRITE_OPERATION, W_TX_PAYLOAD_NO_ACK, sackData, length + 2);
-
-        if (_cePin != _csnPin)
-        {
-            digitalWrite(_cePin, HIGH);
-            delayMicroseconds(CE_TRANSMISSION_MICROS);
-            digitalWrite(_cePin, LOW);
-        }
-        
+        startSend(toRadioId, &sackData, length + 2, REQUIRE_SACK);
         delay(SACK_TX_COMPLETE_MILLIS);
 
         // Change to RX operation.
         writeRegister(CONFIG, readRegister(CONFIG) | _BV(PRIM_RX));
-
         if (_cePin != _csnPin)
         {
             if (digitalRead(_cePin) == LOW) digitalWrite(_cePin, HIGH);
         }
 
+        // Wait for software-ACK.
         delay(SACK_RX_WAIT_TIME_MILLIS);
 
         if (getPipeOfFirstRxPacket() == 1) // Receiver transmits acknowledgement back to our pipe 1 address.
         {
             successFlag = 1;
-            _sackDataLength = getRxPacketLength();
+            _ackDataLength = getRxPacketLength();
 
-            if (_sackDataLength == 2)
+            if (_ackDataLength == 2)
             {
                 // Received non-data packet.
                 spiTransfer(WRITE_OPERATION, FLUSH_RX, NULL, 0);
                 writeRegister(STATUS, readRegister(STATUS) | _BV(RX_DR));
-                _sackDataLength = 0; // Clear the indication of SACK data.
+                _ackDataLength = 0; // Clear the indication of SACK data.
             }
             else
             {
-                // Received data-bearing SACK packet.
+                // Received data-bearing ACK packet.
                 // The transmitter will be able to check for this data using 'hasAckData'.
-                spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_sackData, _sackDataLength);
+                spiTransfer(READ_OPERATION, R_RX_PAYLOAD, &_ackDataPacket, _ackDataLength);
             }
             
             break;

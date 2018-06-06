@@ -66,51 +66,47 @@ class NRFLite {
     
   private:
 
-    // Delay used to discharge the radio's CSN pin when operating in 2-pin mode.
-    // Determined by measuring time to discharge CSN on a 1MHz ATtiny using 0.1uF capacitor and 1K resistor.
-    const static uint16_t CSN_DISCHARGE_MICROS = 500;
-
     const static uint8_t OFF_TO_POWERDOWN_MILLIS = 100; // Vcc > 1.9V power on reset time.
     const static uint8_t STANDBY_TO_RXTX_MODE_MICROS = 130; // Standby to RX or TX mode time.
     const static uint16_t POWERDOWN_TO_RXTX_MODE_MICROS = 4500 + STANDBY_TO_RXTX_MODE_MICROS;
     const static uint8_t CE_TRANSMISSION_MICROS = 11; // Time to initiate data transmission.
 
-    // Determined by ensuring all available packet sizes can be sent and received at all bitrates.
-    const static uint8_t SACK_TX_COMPLETE_MILLIS = 10; // Time to wait for TX to complete.
-    const static uint8_t SACK_TX_TO_RX_MILLIS = SACK_TX_COMPLETE_MILLIS + 10; // Time for transmitter to become a receiver.
-    const static uint8_t SACK_RX_WAIT_TIME_MILLIS = SACK_TX_TO_RX_MILLIS + 10; // Time to wait for reception of the SACK packet.
-
     enum SpiTransferType { READ_OPERATION, WRITE_OPERATION };
 
     Stream *_serial;
-    volatile uint8_t *_momi_PORT;
-    volatile uint8_t *_momi_DDR;
-    volatile uint8_t *_momi_PIN;
-    volatile uint8_t *_sck_PORT;
-    uint8_t _cePin, _csnPin, _momi_MASK, _sck_MASK;
-    uint8_t _resetInterruptFlags, _useTwoPinSpiTransfer;
-    uint8_t _radioId;
+    uint8_t _cePin, _csnPin, _resetInterruptFlags;
     uint16_t _transmissionRetryWaitMicros, _maxHasDataIntervalMicros;
     uint32_t _microsSinceLastDataCheck;
-    uint8_t _useSack;
-    uint8_t _sackData[32], _sackDataLength, _lastSackDataId;
-    uint8_t _requireSackData[32], _receivedDataLength, _lastRequireSackDataId;
-    uint16_t _lastPacketId;
     
     uint8_t getPipeOfFirstRxPacket();
     uint8_t getRxPacketLength();
     uint8_t prepForRx(uint8_t radioId, Bitrates bitrate, uint8_t channel);
     void prepForTx(uint8_t toRadioId, SendType sendType);
-    uint8_t getSackDataLengthAndSendAck();
-    uint8_t sendSackData(uint8_t toRadioId, void *data, uint8_t length);
     uint8_t readRegister(uint8_t regName);
     void readRegister(uint8_t regName, void* data, uint8_t length);
     void writeRegister(uint8_t regName, uint8_t data);
     void writeRegister(uint8_t regName, void* data, uint8_t length);
     void spiTransfer(SpiTransferType transferType, uint8_t regName, void* data, uint8_t length);
     uint8_t usiTransfer(uint8_t data);    
-    uint8_t twoPinTransfer(uint8_t data);
     void printRegister(char name[], uint8_t regName);
+
+    // 2-Pin Variables and Methods
+    const static uint16_t CSN_DISCHARGE_MICROS = 500; // Determined by measuring time to discharge CSN on a 1MHz ATtiny using 0.1uF capacitor and 1K resistor.
+
+    volatile uint8_t *_momi_PORT, *_momi_DDR, *_momi_PIN, *_sck_PORT;
+    uint8_t _momi_MASK, _sck_MASK, _useTwoPinSpiTransfer;
+    uint8_t twoPinTransfer(uint8_t data);
+
+    // Software-based Acknowledgement Variables and Methods
+    const static uint8_t SACK_TX_COMPLETE_MILLIS = 10; // Time to wait for TX to complete.
+    const static uint8_t SACK_TX_TO_RX_MILLIS = SACK_TX_COMPLETE_MILLIS + 10; // Time for transmitter to become a receiver.
+    const static uint8_t SACK_RX_WAIT_TIME_MILLIS = SACK_TX_TO_RX_MILLIS + 10; // Time to wait for reception of the SACK packet.
+
+    uint8_t _radioId, _useSack, _lastPacketId, _ackDataPacket[32], _ackDataLength, _receivedDataPacket[32], _receivedDataLength;
+    uint16_t _lastReceivedPacketHeader;
+
+    uint8_t getRxPacketLengthAndSendSack();
+    uint8_t sendAndWaitForSack(uint8_t toRadioId, void *data, uint8_t length);
 };
 
 #endif
